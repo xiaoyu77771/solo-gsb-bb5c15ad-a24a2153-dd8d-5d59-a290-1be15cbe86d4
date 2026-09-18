@@ -22,6 +22,16 @@ def post(left, right):
     return resp.json()
 
 
+def post_locked(left, right, locked):
+    return client.post(
+        "/reconcile", json={"left": left, "right": right, "locked_groups": locked}
+    )
+
+
+def lock(left_ids, right_ids):
+    return {"left_ids": list(left_ids), "right_ids": list(right_ids)}
+
+
 # --------------------------------------------------------------------- #
 # basic matching
 # --------------------------------------------------------------------- #
@@ -176,6 +186,283 @@ def test_groups_sorted_and_unmatched_listed():
     assert [g["left_ids"] for g in body["groups"]] == [["L1"], ["L2"]]
     assert body["unmatched_left_ids"] == ["L3"]
     assert body["unmatched_right_ids"] == ["R9"]
+
+
+# --------------------------------------------------------------------- #
+# manually confirmed (locked) groups
+# --------------------------------------------------------------------- #
+def test_locked_group_forced_into_solution():
+    # without a lock the (A+B,X)=150 group wins; locking (A,Y)=100 forces it
+    resp = post_locked(
+        [txn("A", 100), txn("B", 50)],
+        [txn("X", 150), txn("Y", 100)],
+        [lock(["A"], ["Y"])],
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["groups"] == [{"left_ids": ["A"], "right_ids": ["Y"], "amount": 100}]
+    assert body["total_amount"] == 100
+    assert body["unmatched_left_ids"] == ["B"]
+    assert body["unmatched_right_ids"] == ["X"]
+
+
+def test_locked_group_one_to_many_shapes():
+    resp = post_locked(
+        [txn("L1", 300)],
+        [txn("R1", 100), txn("R2", 200)],
+        [lock(["L1"], ["R1", "R2"])],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["groups"] == [
+        {"left_ids": ["L1"], "right_ids": ["R1", "R2"], "amount": 300}
+    ]
+
+    resp = post_locked(
+        [txn("L1", 100), txn("L2", 200), txn("L3", 50)],
+        [txn("R1", 350)],
+        [lock(["L1", "L2", "L3"], ["R1"])],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["groups"] == [
+        {"left_ids": ["L1", "L2", "L3"], "right_ids": ["R1"], "amount": 350}
+    ]
+
+
+def test_locked_negative_group():
+    resp = post_locked(
+        [txn("L1", -150)],
+        [txn("R1", -100), txn("R2", -50)],
+        [lock(["L1"], ["R1", "R2"])],
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["groups"] == [
+        {"left_ids": ["L1"], "right_ids": ["R1", "R2"], "amount": -150}
+    ]
+    assert body["total_amount"] == 150
+
+
+def test_multiple_locked_groups_kept():
+    resp = post_locked(
+        [txn("A", 100), txn("B", 100)],
+        [txn("X", 100), txn("Y", 100)],
+        [lock(["A"], ["X"]), lock(["B"], ["Y"])],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["total_amount"] == 200
+    assert len(resp.json()["groups"]) == 2
+
+
+def test_locked_group_remainder_still_optimised():
+    # (A,X) is locked; among the rest the bigger 150 group wins over (B,Z)=100
+    resp = post_locked(
+        [txn("A", 100), txn("B", 50), txn("C", 100)],
+        [txn("X", 100), txn("Y", 150), txn("Z", 100)],
+        [lock(["A"], ["X"])],
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["groups"] == [
+        {"left_ids": ["A"], "right_ids": ["X"], "amount": 100},
+        {"left_ids": ["B", "C"], "right_ids": ["Y"], "amount": 150},
+    ]
+    assert body["total_amount"] == 250
+    assert body["unmatched_right_ids"] == ["Z"]
+
+
+def test_locked_group_tie_break_applies_to_remainder():
+    # locked (A,Y) removes A,Y; the remaining optimum over B/X is fixed.
+    # Here the lex tie-break on the free pool chooses (B,X) — the only option.
+    # Swap: with (A,X) locked, (B,Y) is the free choice.
+    resp = post_locked(
+        [txn("A", 100), txn("B", 100)],
+        [txn("X", 100), txn("Y", 100)],
+        [lock(["A"], ["Y"])],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["groups"] == [
+        {"left_ids": ["A"], "right_ids": ["Y"], "amount": 100},
+        {"left_ids": ["B"], "right_ids": ["X"], "amount": 100},
+    ]
+
+
+def test_locked_group_sits_alongside_lex_smaller_free_group():
+    # the locked encoding can sort after a free group; output stays sorted
+    resp = post_locked(
+        [txn("Z", 100), txn("A", 100)],
+        [txn("Q", 100), txn("X", 100)],
+        [lock(["Z"], ["Q"])],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["groups"] == [
+        {"left_ids": ["A"], "right_ids": ["X"], "amount": 100},
+        {"left_ids": ["Z"], "right_ids": ["Q"], "amount": 100},
+    ]
+
+
+def test_total_and_unmatched_computed_from_merged_result():
+    # locked (L1,R1) plus leftovers that cannot reconcile
+    resp = post_locked(
+        [txn("L1", 100), txn("L2", 7)],
+        [txn("R1", 100), txn("R2", 9)],
+        [lock(["L1"], ["R1"])],
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["groups"] == [{"left_ids": ["L1"], "right_ids": ["R1"], "amount": 100}]
+    assert body["total_amount"] == 100
+    assert body["unmatched_left_ids"] == ["L2"]
+    assert body["unmatched_right_ids"] == ["R2"]
+
+
+def test_locked_group_unknown_id_422_with_index():
+    resp = post_locked(
+        [txn("A", 100)],
+        [txn("X", 100)],
+        [lock(["A"], ["NOPE"])],
+    )
+    assert resp.status_code == 422
+    err = resp.json()["detail"][0]
+    assert err["loc"] == ["body", "locked_groups", 0]
+    assert "NOPE" in err["msg"]
+
+
+def test_locked_group_wrong_side_reference_422():
+    # a left id used in right_ids counts as an unknown reference
+    resp = post_locked(
+        [txn("A", 100)],
+        [txn("X", 100)],
+        [lock(["A"], ["A"])],
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"] == ["body", "locked_groups", 0]
+
+
+def test_locked_group_reused_across_groups_422_with_index():
+    resp = post_locked(
+        [txn("A", 100), txn("B", 100)],
+        [txn("X", 100), txn("Y", 100)],
+        [lock(["A"], ["X"]), lock(["A"], ["Y"])],
+    )
+    assert resp.status_code == 422
+    err = resp.json()["detail"][0]
+    assert err["loc"] == ["body", "locked_groups", 1]
+    assert "reused" in err["msg"]
+
+
+def test_locked_group_duplicate_id_inside_group_422():
+    resp = post_locked(
+        [txn("A", 100)],
+        [txn("X", 100)],
+        [lock(["A", "A"], ["X"])],
+    )
+    assert resp.status_code == 422
+    err = resp.json()["detail"][0]
+    assert err["loc"] == ["body", "locked_groups", 0]
+    assert "duplicate" in err["msg"]
+
+
+def test_locked_group_first_error_reported():
+    # group 0 is fine; group 2 breaks first; group 1 references the later group
+    resp = post_locked(
+        [txn("A", 100), txn("B", 100)],
+        [txn("X", 100), txn("Y", 100)],
+        [
+            lock(["A"], ["X"]),
+            lock(["B"], ["MISSING"]),
+            lock(["B"], ["Y"]),
+        ],
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"] == ["body", "locked_groups", 1]
+
+
+def test_locked_group_bad_shape_422():
+    # 2-2 is not one of the five legal shapes
+    resp = post_locked(
+        [txn("A", 1), txn("B", 1)],
+        [txn("X", 1), txn("Y", 1)],
+        [lock(["A", "B"], ["X", "Y"])],
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"] == ["body", "locked_groups", 0]
+
+
+def test_locked_group_side_too_long_422():
+    # a 4-record side is rejected at schema level
+    resp = post_locked(
+        [txn("A", 1), txn("B", 1), txn("C", 1), txn("D", 1)],
+        [txn("X", 1)],
+        [lock(["A", "B", "C", "D"], ["X"])],
+    )
+    assert resp.status_code == 422
+    assert "locked_groups" in resp.json()["detail"][0]["loc"]
+
+
+def test_locked_group_sum_mismatch_422():
+    resp = post_locked(
+        [txn("A", 100)],
+        [txn("X", 101)],
+        [lock(["A"], ["X"])],
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"] == ["body", "locked_groups", 0]
+
+
+def test_locked_group_mixed_sign_422():
+    resp = post_locked(
+        [txn("A", 100)],
+        [txn("X", -100)],
+        [lock(["A"], ["X"])],
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"] == ["body", "locked_groups", 0]
+
+
+def test_locked_group_beyond_48h_422():
+    resp = post_locked(
+        [txn("A", 100, T0)],
+        [txn("X", 100, "2026-09-19T00:00:01Z")],
+        [lock(["A"], ["X"])],
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"] == ["body", "locked_groups", 0]
+
+
+def test_locked_groups_48h_boundary_accepted():
+    resp = post_locked(
+        [txn("A", 100, T0)],
+        [txn("X", 100, "2026-09-19T00:00:00Z")],
+        [lock(["A"], ["X"])],
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(resp.json()["groups"]) == 1
+
+
+def test_empty_locked_groups_same_as_absent():
+    left, right = [txn("A", 100)], [txn("X", 100)]
+    absent = post(left, right)
+    empty = post_locked(left, right, [])
+    assert empty.status_code == 200
+    assert empty.json() == absent
+    explicit_null = client.post(
+        "/reconcile", json={"left": left, "right": right, "locked_groups": None}
+    )
+    assert explicit_null.status_code == 200
+    assert explicit_null.json() == absent
+
+
+def test_locked_group_schema_errors_422():
+    # missing side, empty side and non-string ids are rejected at schema level
+    for bad in (
+        {"right_ids": ["X"]},
+        {"left_ids": [], "right_ids": ["X"]},
+        {"left_ids": ["A"], "right_ids": [1]},
+    ):
+        resp = post_locked(
+            [txn("A", 100)], [txn("X", 100)], [bad]
+        )
+        assert resp.status_code == 422, bad
 
 
 # --------------------------------------------------------------------- #

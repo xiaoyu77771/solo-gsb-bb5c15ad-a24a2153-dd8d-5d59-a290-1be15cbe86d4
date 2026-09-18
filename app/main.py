@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
+from fastapi.exceptions import RequestValidationError
 
 from .models import GroupOut, ReconcileRequest, ReconcileResponse
-from .solver import Reconciler, Txn
+from .solver import (
+    LockedGroup,
+    LockedGroupError,
+    Reconciler,
+    Txn,
+    resolve_locked_groups,
+)
 
 app = FastAPI(
     title="Batch Reconciliation API",
@@ -28,7 +35,29 @@ def reconcile(payload: ReconcileRequest) -> ReconcileResponse:
     left = [Txn(id=t.id, ts=t.epoch_seconds(), amount=t.amount) for t in payload.left]
     right = [Txn(id=t.id, ts=t.epoch_seconds(), amount=t.amount) for t in payload.right]
 
-    groups = Reconciler(left, right).solve()
+    reconciler = Reconciler(left, right)
+
+    locked_cands = []
+    if payload.locked_groups:
+        locked_in = [
+            LockedGroup(left_ids=tuple(g.left_ids), right_ids=tuple(g.right_ids))
+            for g in payload.locked_groups
+        ]
+        try:
+            locked_cands = resolve_locked_groups(reconciler, locked_in)
+        except LockedGroupError as exc:
+            raise RequestValidationError(
+                [
+                    {
+                        "type": "locked_group.invalid",
+                        "loc": ["body", "locked_groups", exc.index],
+                        "msg": str(exc),
+                        "input": payload.locked_groups[exc.index].model_dump(),
+                    }
+                ]
+            )
+
+    groups = reconciler.solve(locked_cands)
     groups.sort(key=lambda c: c.encoding)
 
     matched_left = {i for c in groups for i in c.left_ids}

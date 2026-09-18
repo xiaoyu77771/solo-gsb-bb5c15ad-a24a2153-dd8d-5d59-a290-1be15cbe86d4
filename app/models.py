@@ -36,11 +36,28 @@ class TransactionIn(BaseModel):
         return dt.timestamp()
 
 
+class LockedGroupIn(BaseModel):
+    """An operator-confirmed group, referencing transactions of this batch.
+
+    ``left_ids`` must reference ids from ``left`` and ``right_ids`` ids from
+    ``right``; the referenced transactions must form a legal group. Semantic
+    validation (unknown ids, reuse across groups, group legality) happens in
+    the endpoint and returns 422 with the offending group's index.
+    """
+
+    left_ids: list[StrictStr] = Field(min_length=1, max_length=3)
+    right_ids: list[StrictStr] = Field(min_length=1, max_length=3)
+
+
 class ReconcileRequest(BaseModel):
     """Batch of fund flows from two sides (at most 12 each)."""
 
     left: list[TransactionIn] = Field(default_factory=list, max_length=MAX_TRANSACTIONS_PER_SIDE)
     right: list[TransactionIn] = Field(default_factory=list, max_length=MAX_TRANSACTIONS_PER_SIDE)
+    locked_groups: list[LockedGroupIn] | None = Field(
+        default=None,
+        description="Optional operator-confirmed groups forced into the solution.",
+    )
 
 
 class GroupOut(BaseModel):

@@ -6,6 +6,12 @@ reconciled amount.  Ties are broken by choosing the solution whose sorted list
 of group encodings -- ``(sorted left ids, sorted right ids)`` -- is
 lexicographically smallest.
 
+A batch may additionally carry *locked groups*: groups an operator has
+confirmed manually.  Locked groups must themselves be legal, each transaction
+may be locked at most once, and every locked group is forced into the solution;
+the global maximum / lexicographic tie-break is then computed over the
+remaining (unlocked) transactions only.
+
 Group legality rules:
   * shapes: 1-1, or a single record on one side with 2-3 on the other;
   * every amount in the group shares the same sign;
@@ -17,6 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import combinations
+from typing import Sequence
 
 MAX_SPAN_SECONDS = 48 * 3600  # 48 hours, inclusive
 # (left count, right count) shapes: 1-1 plus one-to-many (2..3) in both directions.
@@ -45,14 +52,77 @@ class Candidate:
         return (self.left_ids, self.right_ids)
 
 
+@dataclass(frozen=True)
+class LockedGroup:
+    """An operator-confirmed group, referenced by batch transaction ids."""
+
+    left_ids: tuple[str, ...]
+    right_ids: tuple[str, ...]
+
+
+class LockedGroupError(ValueError):
+    """A locked group fails validation; ``index`` is its 0-based list index."""
+
+    def __init__(self, index: int, message: str) -> None:
+        self.index = index
+        super().__init__(f"locked_groups[{index}]: {message}")
+
+
+def resolve_locked_groups(
+    rec: "Reconciler",
+    locked: Sequence[LockedGroup],
+) -> list[Candidate]:
+    """Validate operator-confirmed groups and resolve them to candidates.
+
+    Checks, in input order: duplicated ids inside a single group, references to
+    ids that do not exist on the referenced side, reuse of a transaction across
+    groups, and the common legality rules (shape / sign / equal sums / 48h).
+    The first offending group's 0-based index is reported.
+    """
+    left_ids = {t.id for t in rec.left}
+    right_ids = {t.id for t in rec.right}
+    resolved: list[Candidate] = []
+    seen: set[str] = set()
+    for gi, grp in enumerate(locked):
+        lids = list(grp.left_ids)
+        rids = list(grp.right_ids)
+        if len(set(lids)) != len(lids) or len(set(rids)) != len(rids):
+            raise LockedGroupError(gi, "duplicate transaction id inside group")
+        unknown = [i for i in lids if i not in left_ids]
+        unknown += [i for i in rids if i not in right_ids]
+        if unknown:
+            raise LockedGroupError(gi, f"unknown transaction id: {sorted(set(unknown))[0]}")
+        reused = sorted({i for i in lids + rids if i in seen})
+        if reused:
+            raise LockedGroupError(gi, f"transaction reused by another group: {reused[0]}")
+        seen.update(lids)
+        seen.update(rids)
+        enc = (tuple(sorted(lids)), tuple(sorted(rids)))
+        cand = rec.by_encoding.get(enc)
+        if cand is None:
+            raise LockedGroupError(gi, "group violates shape/sign/amount/48h rules")
+        resolved.append(cand)
+    return resolved
+
+
 class Reconciler:
-    def __init__(self, left: list[Txn], right: list[Txn]) -> None:
+    def __init__(
+        self,
+        left: list[Txn],
+        right: list[Txn],
+        locked: Sequence[Candidate] = (),
+    ) -> None:
         self.left = left
         self.right = right
         self.txns = left + right
         self.n_left = len(left)
+        self.locked: list[Candidate] = list(locked)
         self.amounts = [t.amount for t in self.txns]
         self.candidates: list[Candidate] = self._generate_candidates()
+        # encoding -> candidate; each encoding maps to exactly one candidate
+        self.by_encoding: dict[tuple[tuple[str, ...], tuple[str, ...]], Candidate] = {
+            c.encoding: c for c in self.candidates
+        }
         # candidate indices touching each transaction, heavier first
         self.cand_by_txn: list[list[int]] = [[] for _ in self.txns]
         for ci, cand in enumerate(self.candidates):
@@ -196,17 +266,33 @@ class Reconciler:
     # ------------------------------------------------------------------ #
     # optimal solution with lexicographically smallest sorted encodings
     # ------------------------------------------------------------------ #
-    def solve(self) -> list[Candidate]:
+    def solve(self, locked: Sequence[Candidate] | None = None) -> list[Candidate]:
+        """Return the optimal packing, forcing every ``locked`` group in.
+
+        Locked groups are removed from the available transaction pool; the
+        global maximum and the lexicographic tie-break are computed over the
+        remaining transactions only, then merged back with the locked groups.
+        """
+        if locked is not None:
+            self.locked = list(locked)
+        lock_mask = 0
+        for cand in self.locked:
+            if cand.mask & lock_mask:
+                raise ValueError("locked groups overlap")  # pragma: no cover - guarded upstream
+            lock_mask |= cand.mask
         if not self.candidates:
-            return []
+            return sorted(self.locked, key=lambda c: c.encoding)
         full = (1 << len(self.txns)) - 1
-        remaining_value = self._max_value(full)
+        free = full ^ lock_mask
+        remaining_value = self._max_value(free)
         # A candidate can open an optimal residual solution iff the rest still
         # achieves the remaining optimum; taking the smallest such encoding at
         # every step yields the lexicographically smallest sorted encoding list.
+        # Candidates touching a locked transaction never fit ``mask``, so they
+        # are excluded automatically.
         ordered = sorted(range(len(self.candidates)), key=lambda ci: self.candidates[ci].encoding)
         solution: list[Candidate] = []
-        mask = full
+        mask = free
         while remaining_value > 0:
             for ci in ordered:
                 cand = self.candidates[ci]
@@ -219,4 +305,4 @@ class Reconciler:
                     break
             else:  # pragma: no cover - defensive, cannot happen if _max_value is exact
                 raise RuntimeError("no feasible candidate for the remaining optimum")
-        return solution
+        return sorted(self.locked + solution, key=lambda c: c.encoding)

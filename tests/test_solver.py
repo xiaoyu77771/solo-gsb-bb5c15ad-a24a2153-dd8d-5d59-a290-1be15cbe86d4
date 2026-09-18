@@ -6,7 +6,7 @@ import random
 
 import pytest
 
-from app.solver import Reconciler, Txn
+from app.solver import LockedGroup, Reconciler, Txn, resolve_locked_groups
 
 BASE_TS = 1_758_000_000.0  # fixed epoch for reproducibility
 
@@ -128,3 +128,163 @@ def test_large_random_batch_completes():
     used = [id_ for group in enc for side in group for id_ in side]
     assert len(used) == len(set(used))
     assert weight >= 0
+
+
+# --------------------------------------------------------------------- #
+# locked groups
+# --------------------------------------------------------------------- #
+def brute_force_locked(
+    left: list[Txn],
+    right: list[Txn],
+    locked_encs: list,
+    free_mask: int,
+):
+    """Like brute_force, but candidates must fit inside ``free_mask`` and the
+    locked encodings are folded into the lexicographic comparison."""
+    rec = Reconciler(left, right)
+    cands = rec.candidates
+    by_txn: list[list[int]] = [[] for _ in rec.txns]
+    for ci, c in enumerate(cands):
+        m = c.mask
+        while m:
+            b = m & (-m)
+            by_txn[b.bit_length() - 1].append(ci)
+            m &= m - 1
+
+    best_weight = 0
+    best_enc: list | None = None
+
+    def consider(weight: int, chosen: list[int]) -> None:
+        nonlocal best_weight, best_enc
+        enc = sorted(locked_encs + [cands[j].encoding for j in chosen])
+        if weight > best_weight or (
+            weight == best_weight and (best_enc is None or enc < best_enc)
+        ):
+            best_weight = weight
+            best_enc = enc
+
+    def search(mask: int, weight: int, chosen: list[int]) -> None:
+        consider(weight, chosen)
+        if mask == 0:
+            return
+        b = mask & (-mask)
+        t = b.bit_length() - 1
+        search(mask & ~b, weight, chosen)
+        for ci in by_txn[t]:
+            cm = cands[ci].mask
+            if cm & mask == cm:
+                chosen.append(ci)
+                search(mask ^ cm, weight + cands[ci].weight, chosen)
+                chosen.pop()
+
+    search(free_mask, 0, [])
+    return best_weight, (best_enc or [])
+
+
+def solve_locked(left: list[Txn], right: list[Txn], locked_specs):
+    rec = Reconciler(left, right)
+    locked = [
+        LockedGroup(left_ids=tuple(sorted(l)), right_ids=tuple(sorted(r)))
+        for l, r in locked_specs
+    ]
+    locked_cands = resolve_locked_groups(rec, locked)
+    groups = rec.solve(locked_cands)
+    return sum(g.weight for g in groups), sorted(g.encoding for g in groups)
+
+
+def test_locked_group_forced_and_remainder_optimal():
+    # (A,X) locked; without it (A+B,Y)=150 would win, now only B stays free
+    left = [make_txn("A", 100), make_txn("B", 50)]
+    right = [make_txn("X", 100), make_txn("Y", 150)]
+    weight, enc = solve_locked(left, right, [(("A",), ("X",))])
+    assert weight == 100
+    assert enc == [(("A",), ("X",))]
+
+
+def test_locked_group_errors_report_index():
+    from app.solver import LockedGroupError
+
+    left = [make_txn("A", 100), make_txn("B", 100)]
+    right = [make_txn("X", 100), make_txn("Y", 100)]
+    rec = Reconciler(left, right)
+
+    with pytest.raises(LockedGroupError) as ei:
+        resolve_locked_groups(rec, [LockedGroup(("A",), ("NOPE",))])
+    assert ei.value.index == 0
+    with pytest.raises(LockedGroupError) as ei:
+        resolve_locked_groups(
+            rec,
+            [LockedGroup(("A",), ("X",)), LockedGroup(("A",), ("Y",))],
+        )
+    assert ei.value.index == 1
+    with pytest.raises(LockedGroupError) as ei:
+        resolve_locked_groups(
+            rec, [LockedGroup(("A", "A"), ("X",))]
+        )
+    assert ei.value.index == 0
+    # illegal group: amounts differ
+    with pytest.raises(LockedGroupError) as ei:
+        resolve_locked_groups(
+            Reconciler([make_txn("A", 100)], [make_txn("X", 101)]),
+            [LockedGroup(("A",), ("X",))],
+        )
+    assert ei.value.index == 0
+
+
+@pytest.mark.parametrize("seed", range(120))
+def test_locked_groups_against_brute_force(seed: int):
+    rng = random.Random(10_000 + seed)
+    n_left = rng.randint(0, 5)
+    n_right = rng.randint(0, 5)
+    left = [
+        Txn(f"L{i}", BASE_TS + rng.randint(0, 4 * 86400),
+            rng.choice([-300, -200, -100, -50, 50, 100, 200, 300]))
+        for i in range(n_left)
+    ]
+    right = [
+        Txn(f"R{i}", BASE_TS + rng.randint(0, 4 * 86400),
+            rng.choice([-300, -200, -100, -50, 50, 100, 200, 300]))
+        for i in range(n_right)
+    ]
+    rec = Reconciler(left, right)
+
+    # pick a random set of mutually disjoint legal groups as the locked set
+    pool = list(rec.candidates)
+    rng.shuffle(pool)
+    used_mask = 0
+    locked_cands = []
+    for cand in pool:
+        if cand.mask & used_mask == 0 and rng.random() < 0.35:
+            locked_cands.append(cand)
+            used_mask |= cand.mask
+
+    groups = rec.solve(locked_cands)
+    weight = sum(g.weight for g in groups)
+    enc = sorted(g.encoding for g in groups)
+
+    full = (1 << len(rec.txns)) - 1
+    locked_encs = [c.encoding for c in locked_cands]
+    assert weight == (
+        sum(c.weight for c in locked_cands)
+        + rec._max_value(full ^ used_mask)
+    )
+    assert enc == brute_force_locked(
+        left, right, locked_encs, full ^ used_mask
+    )[1]
+
+
+def test_locked_full_batch():
+    # 12 vs 12: two locked one-to-many groups, the rest still perfectly packs
+    left = [make_txn("L0", 200), make_txn("L1", 100), make_txn("L2", 100)] + [
+        make_txn(f"L{i}", 100) for i in range(3, 12)
+    ]
+    right = [make_txn("R0", 100), make_txn("R1", 100), make_txn("R2", 200)] + [
+        make_txn(f"R{i}", 100) for i in range(3, 12)
+    ]
+    specs = [(("L0",), ("R0", "R1")), (("L1", "L2"), ("R2",))]
+    weight, enc = solve_locked(left, right, specs)
+    assert weight == 1300  # 400 locked + 900 from the remaining nine 1-1 pairs
+    assert (("L0",), ("R0", "R1")) in enc
+    assert (("L1", "L2"), ("R2",)) in enc
+    used = [id_ for group in enc for side in group for id_ in side]
+    assert len(used) == len(set(used)) == 24

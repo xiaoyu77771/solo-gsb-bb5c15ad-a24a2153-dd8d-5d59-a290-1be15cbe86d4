@@ -33,6 +33,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   "right": [
     { "id": "R1", "time": "2026-09-17T01:00:00Z", "amount": 100 },
     { "id": "R2", "time": "2026-09-17T02:00:00Z", "amount": 200 }
+  ],
+  "locked_groups": [
+    { "left_ids": ["L1"], "right_ids": ["R1", "R2"] }
   ]
 }
 ```
@@ -44,6 +47,39 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `amount` | 非零带符号整数（单位：分）；`0`、布尔、浮点、字符串均返回 **422**   |
 
 每侧 0～12 笔，超过 12 笔返回 **422**。
+
+### 人工确认组（`locked_groups`，可选）
+
+`locked_groups` 为可选字段，用于提交人工已确认的核销组；数组中每组通过
+`left_ids` / `right_ids` 引用**本批次** `left` / `right` 中的流水。不传该字段或传
+`[]` / `null` 时，响应与原行为完全一致。
+
+锁定组必须满足：
+
+- `left_ids` 只能引用本批次 left 的 ID，`right_ids` 只能引用本批次 right 的 ID；
+- 符合上文全部核销组规则（五种组形之一、组内同号、两侧金额之和相等、时间跨度 ≤ 48 小时）；
+- 同一组内不得有重复 ID；任意一笔流水不得被多个锁定组重复使用。
+
+任一条件不满足均返回 **422**，错误 `loc` 为
+`["body", "locked_groups", <序号>]`，`<序号>` 为出问题组从 0 开始的下标（按数组顺序报告首个错误）。例如：
+
+```json
+{
+  "detail": [
+    {
+      "type": "locked_group.invalid",
+      "loc": ["body", "locked_groups", 1],
+      "msg": "locked_groups[1]: transaction reused by another group: A",
+      "input": { "left_ids": ["A"], "right_ids": ["Y"] }
+    }
+  ]
+}
+```
+
+求解时**全部锁定组都会被保留**，其流水从候选池中移除；只在剩余流水上执行原有的
+“核销金额绝对值总和最大 + 组编码列表字典序最小”求解。最终 `groups` 为锁定组与
+自由求解结果的合并（仍按组编码升序），`total_amount` 与 `unmatched_*` 均按合并结果计算。
+
 
 **核销组规则**
 
@@ -83,6 +119,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 3. 在达到最大权值的前提下，逐步选取能构成残余最优解中编码最小的候选组，
    得到字典序最小的最优解。
 
+存在 `locked_groups` 时，先将全部锁定组（已通过同样的合法性校验）对应的流水从
+位掩码中剔除，再对剩余掩码执行步骤 2、3，最后把锁定组并入结果。
+
 实测 12×12 极端稠密批次求解耗时约 50ms 以内。
 
 ## 测试
@@ -92,7 +131,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-包含 API 行为测试与求解器对暴力枚举的随机差分测试。
+包含 API 行为测试与求解器对暴力枚举的随机差分测试（含带 `locked_groups` 的场景）。
 
 ## 项目结构
 
