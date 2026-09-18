@@ -6,6 +6,10 @@ reconciled amount.  Ties are broken by choosing the solution whose sorted list
 of group encodings -- ``(sorted left ids, sorted right ids)`` -- is
 lexicographically smallest.
 
+Manually confirmed (locked) groups may be supplied: they are validated against
+the same legality rules, always kept in the result, and the optimisation runs
+over the remaining transactions only.
+
 Group legality rules:
   * shapes: 1-1, or a single record on one side with 2-3 on the other;
   * every amount in the group shares the same sign;
@@ -15,6 +19,7 @@ Group legality rules:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import combinations
 
@@ -43,6 +48,61 @@ class Candidate:
     @property
     def encoding(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
         return (self.left_ids, self.right_ids)
+
+
+class LockedGroupError(ValueError):
+    """A locked group violates the reconciliation rules."""
+
+
+def validate_locked_groups(
+    left: list[Txn],
+    right: list[Txn],
+    locked_groups: Sequence[tuple[Sequence[str], Sequence[str]]],
+) -> None:
+    """Validate manually locked groups against the reconciliation rules.
+
+    Every referenced id must exist in the batch, no transaction may be used
+    by more than one locked group (or twice within the same one), and each
+    group must satisfy the usual legality rules (shape, same sign, equal
+    sums, 48-hour span).  Raises :class:`LockedGroupError` whose message
+    starts with ``locked_groups[<index>]`` (0-based) on the first violation.
+    """
+    left_by_id = {t.id: t for t in left}
+    right_by_id = {t.id: t for t in right}
+    used: set[str] = set()
+    for gi, (left_ids, right_ids) in enumerate(locked_groups):
+        where = f"locked_groups[{gi}]"
+        txns: list[Txn] = []
+        for id_ in left_ids:
+            txn = left_by_id.get(id_)
+            if txn is None:
+                raise LockedGroupError(f"{where}: no left transaction with id {id_!r}")
+            txns.append(txn)
+        for id_ in right_ids:
+            txn = right_by_id.get(id_)
+            if txn is None:
+                raise LockedGroupError(f"{where}: no right transaction with id {id_!r}")
+            txns.append(txn)
+        for id_ in (*left_ids, *right_ids):
+            if id_ in used:
+                raise LockedGroupError(f"{where}: transaction id {id_!r} is used more than once")
+            used.add(id_)
+        shape = (len(left_ids), len(right_ids))
+        if shape not in GROUP_SHAPES:
+            allowed = ", ".join(f"{nl}-{nr}" for nl, nr in GROUP_SHAPES)
+            raise LockedGroupError(
+                f"{where}: shape {shape[0]}-{shape[1]} is not one of {allowed}"
+            )
+        amounts = [t.amount for t in txns]
+        if not (all(a > 0 for a in amounts) or all(a < 0 for a in amounts)):
+            raise LockedGroupError(f"{where}: amounts must all share the same sign")
+        sum_left = sum(t.amount for t in txns[: len(left_ids)])
+        sum_right = sum(t.amount for t in txns[len(left_ids):])
+        if sum_left != sum_right:
+            raise LockedGroupError(f"{where}: side sums differ ({sum_left} != {sum_right})")
+        times = [t.ts for t in txns]
+        if max(times) - min(times) > MAX_SPAN_SECONDS:
+            raise LockedGroupError(f"{where}: time span exceeds 48 hours")
 
 
 class Reconciler:
@@ -101,6 +161,14 @@ class Reconciler:
                         )
                     )
         return cands
+
+    def locked_candidate(self, left_ids: Sequence[str], right_ids: Sequence[str]) -> Candidate:
+        """Return the generated candidate matching a validated locked group."""
+        encoding = (tuple(sorted(left_ids)), tuple(sorted(right_ids)))
+        for cand in self.candidates:
+            if cand.encoding == encoding:
+                return cand
+        raise RuntimeError("validated locked group missing from candidates")  # pragma: no cover
 
     # ------------------------------------------------------------------ #
     # maximum total weight over a transaction subset (bitmask)
@@ -196,17 +264,28 @@ class Reconciler:
     # ------------------------------------------------------------------ #
     # optimal solution with lexicographically smallest sorted encodings
     # ------------------------------------------------------------------ #
-    def solve(self) -> list[Candidate]:
+    def solve(self, locked: list[Candidate] | None = None) -> list[Candidate]:
+        """Return the optimal mutually exclusive set of candidates.
+
+        Locked candidates (validated via :func:`validate_locked_groups`)
+        are always kept; the global optimum -- maximum total weight, then
+        lexicographically smallest sorted encodings -- is computed over
+        the remaining transactions only.
+        """
+        locked = list(locked or [])
+        locked_mask = 0
+        for cand in locked:
+            locked_mask |= cand.mask
+        available = ((1 << len(self.txns)) - 1) & ~locked_mask
         if not self.candidates:
-            return []
-        full = (1 << len(self.txns)) - 1
-        remaining_value = self._max_value(full)
+            return locked
+        remaining_value = self._max_value(available)
         # A candidate can open an optimal residual solution iff the rest still
         # achieves the remaining optimum; taking the smallest such encoding at
         # every step yields the lexicographically smallest sorted encoding list.
         ordered = sorted(range(len(self.candidates)), key=lambda ci: self.candidates[ci].encoding)
-        solution: list[Candidate] = []
-        mask = full
+        solution = list(locked)
+        mask = available
         while remaining_value > 0:
             for ci in ordered:
                 cand = self.candidates[ci]

@@ -36,11 +36,23 @@ class TransactionIn(BaseModel):
         return dt.timestamp()
 
 
+class LockedGroupIn(BaseModel):
+    """A manually confirmed group that must be kept in the result.
+
+    Both lists reference transactions of this batch by id; the group must
+    satisfy the same legality rules as automatically generated ones.
+    """
+
+    left_ids: list[StrictStr]
+    right_ids: list[StrictStr]
+
+
 class ReconcileRequest(BaseModel):
     """Batch of fund flows from two sides (at most 12 each)."""
 
     left: list[TransactionIn] = Field(default_factory=list, max_length=MAX_TRANSACTIONS_PER_SIDE)
     right: list[TransactionIn] = Field(default_factory=list, max_length=MAX_TRANSACTIONS_PER_SIDE)
+    locked_groups: list[LockedGroupIn] = Field(default_factory=list)
 
 
 class GroupOut(BaseModel):

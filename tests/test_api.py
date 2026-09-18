@@ -223,3 +223,197 @@ def test_full_batch_of_12_per_side():
     body = post(left, right)
     assert body["total_amount"] == 1200
     assert len(body["groups"]) == 12
+
+
+# --------------------------------------------------------------------- #
+# locked groups (manual confirmation)
+# --------------------------------------------------------------------- #
+def post_locked(left, right, locked_groups):
+    resp = client.post(
+        "/reconcile",
+        json={"left": left, "right": right, "locked_groups": locked_groups},
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def lock_resp(left, right, locked_groups):
+    return client.post(
+        "/reconcile",
+        json={"left": left, "right": right, "locked_groups": locked_groups},
+    )
+
+
+def test_locked_group_is_preserved_over_global_optimum():
+    # unconstrained optimum would be (A+B, X)=150; locking (A, Y) must win out
+    body = post_locked(
+        [txn("A", 100), txn("B", 50)],
+        [txn("X", 150), txn("Y", 100)],
+        [{"left_ids": ["A"], "right_ids": ["Y"]}],
+    )
+    assert body["groups"] == [{"left_ids": ["A"], "right_ids": ["Y"], "amount": 100}]
+    assert body["total_amount"] == 100
+    assert body["unmatched_left_ids"] == ["B"]
+    assert body["unmatched_right_ids"] == ["X"]
+
+
+def test_locked_groups_merge_with_optimised_remainder():
+    body = post_locked(
+        [txn("A", 100), txn("B", 100), txn("C", 200)],
+        [txn("X", 100), txn("Y", 100), txn("Z", 200)],
+        [{"left_ids": ["A"], "right_ids": ["X"]}],
+    )
+    assert body["groups"] == [
+        {"left_ids": ["A"], "right_ids": ["X"], "amount": 100},
+        {"left_ids": ["B"], "right_ids": ["Y"], "amount": 100},
+        {"left_ids": ["C"], "right_ids": ["Z"], "amount": 200},
+    ]
+    assert body["total_amount"] == 400
+    assert body["unmatched_left_ids"] == []
+    assert body["unmatched_right_ids"] == []
+
+
+def test_residual_still_uses_lexicographic_tie_break():
+    # after locking (C, Z) the remainder has two optimal solutions; the
+    # lexicographically smallest one must be chosen
+    body = post_locked(
+        [txn("B", 100), txn("A", 100), txn("C", 50)],
+        [txn("Y", 100), txn("X", 100), txn("Z", 50)],
+        [{"left_ids": ["C"], "right_ids": ["Z"]}],
+    )
+    assert body["groups"] == [
+        {"left_ids": ["A"], "right_ids": ["X"], "amount": 100},
+        {"left_ids": ["B"], "right_ids": ["Y"], "amount": 100},
+        {"left_ids": ["C"], "right_ids": ["Z"], "amount": 50},
+    ]
+    assert body["total_amount"] == 250
+
+
+def test_multiple_locked_groups_sorted_in_response():
+    body = post_locked(
+        [txn("A", 100), txn("B", 200)],
+        [txn("X", 100), txn("Y", 200)],
+        [
+            {"left_ids": ["B"], "right_ids": ["Y"]},
+            {"left_ids": ["A"], "right_ids": ["X"]},
+        ],
+    )
+    # response groups are sorted by encoding regardless of lock order
+    assert [g["left_ids"] for g in body["groups"]] == [["A"], ["B"]]
+    assert body["total_amount"] == 300
+
+
+def test_locked_one_to_many_negative_group():
+    body = post_locked(
+        [txn("L1", -150)],
+        [txn("R1", -100), txn("R2", -50)],
+        [{"left_ids": ["L1"], "right_ids": ["R1", "R2"]}],
+    )
+    assert body["groups"] == [{"left_ids": ["L1"], "right_ids": ["R1", "R2"], "amount": -150}]
+    assert body["total_amount"] == 150
+
+
+def test_locked_group_consuming_everything():
+    body = post_locked(
+        [txn("L1", 100)],
+        [txn("R1", 100)],
+        [{"left_ids": ["L1"], "right_ids": ["R1"]}],
+    )
+    assert body["groups"] == [{"left_ids": ["L1"], "right_ids": ["R1"], "amount": 100}]
+    assert body["total_amount"] == 100
+    assert body["unmatched_left_ids"] == []
+    assert body["unmatched_right_ids"] == []
+
+
+def test_empty_locked_groups_behaves_like_unset():
+    left = [txn("A", 100), txn("B", 50)]
+    right = [txn("X", 150), txn("Y", 100)]
+    assert post_locked(left, right, []) == post(left, right)
+
+
+def test_locked_group_unknown_id_returns_422():
+    resp = lock_resp(
+        [txn("L1", 100)], [txn("R1", 100)], [{"left_ids": ["L1"], "right_ids": ["RX"]}]
+    )
+    assert resp.status_code == 422
+    assert "locked_groups[0]" in resp.json()["detail"]
+    # an existing id of the wrong side is equally unknown
+    resp = lock_resp(
+        [txn("L1", 100)], [txn("R1", 100)], [{"left_ids": ["R1"], "right_ids": ["L1"]}]
+    )
+    assert resp.status_code == 422
+    assert "locked_groups[0]" in resp.json()["detail"]
+
+
+def test_locked_group_reuse_returns_422():
+    left = [txn("L1", 100), txn("L2", 100)]
+    right = [txn("R1", 100), txn("R2", 100)]
+    # reused across two locked groups: the second group is reported
+    resp = lock_resp(
+        left,
+        right,
+        [
+            {"left_ids": ["L1"], "right_ids": ["R1"]},
+            {"left_ids": ["L1"], "right_ids": ["R2"]},
+        ],
+    )
+    assert resp.status_code == 422
+    assert "locked_groups[1]" in resp.json()["detail"]
+    # repeated within a single group
+    resp = lock_resp(left, right, [{"left_ids": ["L1", "L1"], "right_ids": ["R1"]}])
+    assert resp.status_code == 422
+    assert "locked_groups[0]" in resp.json()["detail"]
+
+
+def test_locked_group_rule_violations_return_422():
+    cases = [
+        # 2-2 is not one of the five legal shapes
+        (
+            [txn("L1", 50), txn("L2", 50)],
+            [txn("R1", 50), txn("R2", 50)],
+            {"left_ids": ["L1", "L2"], "right_ids": ["R1", "R2"]},
+        ),
+        # four records on one side
+        (
+            [txn("L1", 25), txn("L2", 25), txn("L3", 25), txn("L4", 25)],
+            [txn("R1", 100)],
+            {"left_ids": ["L1", "L2", "L3", "L4"], "right_ids": ["R1"]},
+        ),
+        # empty side
+        ([txn("L1", 100)], [txn("R1", 100)], {"left_ids": [], "right_ids": ["R1"]}),
+        # mixed signs (sums happen to match)
+        (
+            [txn("L1", 100)],
+            [txn("R1", 150), txn("R2", -50)],
+            {"left_ids": ["L1"], "right_ids": ["R1", "R2"]},
+        ),
+        # unequal sums
+        (
+            [txn("L1", 100)],
+            [txn("R1", 60), txn("R2", 50)],
+            {"left_ids": ["L1"], "right_ids": ["R1", "R2"]},
+        ),
+        # span beyond 48 hours
+        (
+            [txn("L1", 100, T0)],
+            [txn("R1", 100, "2026-09-19T00:00:01Z")],
+            {"left_ids": ["L1"], "right_ids": ["R1"]},
+        ),
+    ]
+    for left, right, group in cases:
+        resp = lock_resp(left, right, [group])
+        assert resp.status_code == 422, group
+        assert "locked_groups[0]" in resp.json()["detail"]
+
+
+def test_locked_group_error_reports_failing_group_index():
+    resp = lock_resp(
+        [txn("L1", 100), txn("L2", 100)],
+        [txn("R1", 100), txn("R2", 100)],
+        [
+            {"left_ids": ["L1"], "right_ids": ["R1"]},
+            {"left_ids": ["L2"], "right_ids": ["R9"]},
+        ],
+    )
+    assert resp.status_code == 422
+    assert "locked_groups[1]" in resp.json()["detail"]
